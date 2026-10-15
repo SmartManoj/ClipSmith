@@ -1,5 +1,5 @@
 # Clipboard monitor: strips the trailing slash from a copied URL (any copy method).
-import ctypes, re, time
+import base64, ctypes, re, subprocess, time
 from ctypes import wintypes as w
 
 u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
@@ -49,13 +49,34 @@ def set_text(s):
     finally:
         u32.CloseClipboard()
 
+# Win+V history keeps the original copy too; delete it so only the clean URL remains.
+PS_DELETE = r"""
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$C=[Windows.ApplicationModel.DataTransfer.Clipboard,Windows.ApplicationModel.DataTransfer,ContentType=WindowsRuntime]
+$asTask=[System.WindowsRuntimeSystemExtensions].GetMethods()|?{$_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'}|select -First 1
+function Await($op,$t){$x=$asTask.MakeGenericMethod($t).Invoke($null,@($op));$x.Wait();$x.Result}
+$r=Await ($C::GetHistoryItemsAsync()) ([Windows.ApplicationModel.DataTransfer.ClipboardHistoryItemsResult])
+foreach($i in $r.Items){ if((Await ($i.Content.GetTextAsync()) ([string])).Trim() -eq '%s'){ [void]$C::DeleteItemFromHistory($i) } }
+"""
+
+def drop_from_history(text):
+    cmd = PS_DELETE % text.strip().replace("'", "''")
+    enc = base64.b64encode(cmd.encode('utf-16-le')).decode()
+    subprocess.Popen(['powershell', '-NoProfile', '-EncodedCommand', enc],
+                     creationflags=subprocess.CREATE_NO_WINDOW)
+
 last = None
 while True:
     seq = u32.GetClipboardSequenceNumber()
     if seq != last:
+        # let the copying app finish writing before we open the clipboard
+        time.sleep(0.5)
+        if u32.GetClipboardSequenceNumber() != seq:
+            continue
         last = seq
         t = get_text()
         if t and URL.match(t):
             set_text(t.strip().rstrip('/'))
+            drop_from_history(t)
             last = u32.GetClipboardSequenceNumber()
     time.sleep(0.3)
