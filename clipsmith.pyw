@@ -13,8 +13,12 @@ Add-Type -AssemblyName System.Runtime.WindowsRuntime
 $C=[Windows.ApplicationModel.DataTransfer.Clipboard,Windows.ApplicationModel.DataTransfer,ContentType=WindowsRuntime]
 $asTask=[System.WindowsRuntimeSystemExtensions].GetMethods()|?{$_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'}|select -First 1
 function Await($op,$t){$x=$asTask.MakeGenericMethod($t).Invoke($null,@($op));$x.Wait();$x.Result}
-$r=Await ($C::GetHistoryItemsAsync()) ([Windows.ApplicationModel.DataTransfer.ClipboardHistoryItemsResult])
-foreach($i in $r.Items){ try { if((Await ($i.Content.GetTextAsync()) ([string])).Trim() -eq '%s'){ [void]$C::DeleteItemFromHistory($i) } } catch {} }
+for($n=0; $n -lt 10; $n++){
+  $r=Await ($C::GetHistoryItemsAsync()) ([Windows.ApplicationModel.DataTransfer.ClipboardHistoryItemsResult])
+  $hit=$false
+  foreach($i in $r.Items){ try { if((Await ($i.Content.GetTextAsync()) ([string])).Trim() -eq '%s'){ [void]$C::DeleteItemFromHistory($i); $hit=$true } } catch {} }
+  if($hit){ break }; Start-Sleep -Milliseconds 300
+}
 """
 
 if sys.platform == 'win32':
@@ -74,11 +78,40 @@ if sys.platform == 'win32':
         subprocess.Popen(['powershell', '-NoProfile', '-EncodedCommand', enc],
                          creationflags=subprocess.CREATE_NO_WINDOW)
 
-    def change_token():
-        return u32.GetClipboardSequenceNumber()
-
     def after_fix(original):
         drop_from_history(original)
+
+    def watch(on_change):
+        # event-driven: Windows notifies us the moment the clipboard changes
+        WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, w.HWND, w.UINT, w.WPARAM, w.LPARAM)
+        u32.DefWindowProcW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
+        u32.DefWindowProcW.restype = ctypes.c_ssize_t
+        u32.CreateWindowExW.restype = w.HWND
+        u32.CreateWindowExW.argtypes = [w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD, ctypes.c_int, ctypes.c_int,
+                                        ctypes.c_int, ctypes.c_int, w.HWND, w.HMENU, w.HINSTANCE, w.LPVOID]
+        WM_CLIPBOARDUPDATE, HWND_MESSAGE = 0x031D, w.HWND(-3)
+
+        def proc(hwnd, msg, wp, lp):
+            if msg == WM_CLIPBOARDUPDATE:
+                on_change()
+                return 0
+            return u32.DefWindowProcW(hwnd, msg, wp, lp)
+
+        class WNDCLASS(ctypes.Structure):
+            _fields_ = [('style', w.UINT), ('lpfnWndProc', WNDPROC), ('cbClsExtra', ctypes.c_int),
+                        ('cbWndExtra', ctypes.c_int), ('hInstance', w.HINSTANCE), ('hIcon', w.HICON),
+                        ('hCursor', w.HANDLE), ('hbrBackground', w.HBRUSH), ('lpszMenuName', w.LPCWSTR),
+                        ('lpszClassName', w.LPCWSTR)]
+
+        wndproc = WNDPROC(proc)
+        wc = WNDCLASS(lpfnWndProc=wndproc, lpszClassName='ClipSmith')
+        u32.RegisterClassW(ctypes.byref(wc))
+        hwnd = u32.CreateWindowExW(0, 'ClipSmith', 'ClipSmith', 0, 0, 0, 0, 0, HWND_MESSAGE, None, None, None)
+        u32.AddClipboardFormatListener(hwnd)
+        msg = w.MSG()
+        while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            u32.TranslateMessage(ctypes.byref(msg))
+            u32.DispatchMessageW(ctypes.byref(msg))
 
 else:
     if sys.platform == 'darwin':
@@ -101,25 +134,24 @@ else:
         subprocess.run(SET, input=s.encode(), env=ENV,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # no cheap change counter without native bindings, so the text itself is the token
-    change_token = get_text
-
     def after_fix(original):
         pass
 
-last = None
-while True:
-    tok = change_token()
-    if tok != last:
-        # let the copying app finish writing (OLE apps flush ~0.5s after setting)
-        time.sleep(1)
-        if change_token() != tok:
-            continue
-        last = tok
-        t = get_text()
-        fixed = t and clean(t)
-        if fixed:
-            set_text(fixed)
-            after_fix(t)
-            last = change_token()
-    time.sleep(0.3)
+    def watch(on_change):
+        # no change notification without native bindings, so poll the text itself
+        last = None
+        while True:
+            t = get_text()
+            if t != last:
+                last = t
+                on_change()
+            time.sleep(0.2)
+
+def on_change():
+    t = get_text()
+    fixed = t and clean(t)
+    if fixed:
+        set_text(fixed)
+        after_fix(t)
+
+watch(on_change)
